@@ -1,0 +1,12 @@
+# Optional dependencies for dfir_triage.py
+#
+# The script runs without these, but each one unlocks specific modules:
+#   python-evtx -> Process Creation, Network, DHCP, DNS, Authentication (EVTX parsing)
+#   regipy      -> USB history, Persistence (Run keys/Services), Amcache, Shimcache,
+#                  Shellbags, interface/DHCP registry config, Recycle Bin SID->username
+#   olefile     -> Jump Lists (AutomaticDestinations .automaticDestinations-ms)
+#
+# Versions below are the ones this script was tested against.
+python-evtx==0.8.1
+regipy==6.5.0
+olefile==0.47
