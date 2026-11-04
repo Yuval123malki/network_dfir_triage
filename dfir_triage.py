@@ -48,6 +48,7 @@ import os
 import re
 import struct
 import sys
+import time
 import traceback
 from pathlib import Path, PureWindowsPath
 
@@ -125,10 +126,24 @@ def unix_to_iso(epoch_seconds):
         return None
 
 
-def safe_copy(src: Path, dest_dir: Path, logger) -> Path:
+def human_size(num_bytes):
+    try:
+        num_bytes = float(num_bytes)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num_bytes < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} PB"
+
+
+def safe_copy(src: Path, dest_dir: Path, logger, announce=True) -> Path:
     """Read-only copy of a single file from the target drive into our output
     tree. Returns the destination Path, or None on failure. Never opens the
-    source for writing."""
+    source for writing. Streams in chunks (never loads the whole file into
+    memory) so multi-GB EVTX logs / hives don't blow up RAM, and announces
+    large copies on the console so the tool doesn't look frozen."""
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / src.name
@@ -136,13 +151,22 @@ def safe_copy(src: Path, dest_dir: Path, logger) -> Path:
         # user profiles (e.g. NTUSER.DAT, USRCLASS.DAT, $I files, etc.)
         if dest_path.exists():
             dest_path = dest_dir / f"{src.parent.name}_{src.name}"
-        with open(src, "rb") as fsrc:
-            data = fsrc.read()
-        with open(dest_path, "wb") as fdst:
-            fdst.write(data)
+
+        size = src.stat().st_size
+        if announce and size > 25 * 1024 * 1024:
+            logger.info(f"Copying {src.name} ({human_size(size)}) - this may take a moment...")
+
+        start = time.time()
+        with open(src, "rb") as fsrc, open(dest_path, "wb") as fdst:
+            import shutil as _shutil
+            _shutil.copyfileobj(fsrc, fdst, length=4 * 1024 * 1024)
+
+        if announce and size > 25 * 1024 * 1024:
+            elapsed = time.time() - start
+            logger.info(f"Copied {src.name} ({human_size(size)}) in {elapsed:.1f}s")
         return dest_path
     except Exception as e:
-        logger.warning(f"Could not copy {src}: {e}")
+        logger.warning(f"Could not copy {src}: {e} - continuing with remaining artifacts")
         return None
 
 
@@ -250,7 +274,31 @@ def make_output_dirs(output_root: Path):
     return dirs
 
 
+class ConsoleFormatter(logging.Formatter):
+    """Makes WARNING/ERROR stand out live in the console as a visible
+    ALERT banner, instead of looking like routine INFO text that's easy to
+    miss while scrolling past. Normal INFO lines are left as-is."""
+
+    def format(self, record):
+        message = record.getMessage()
+        if record.levelno >= logging.ERROR:
+            return f"\n!!! ALERT (ERROR) !!! {message}\n"
+        if record.levelno >= logging.WARNING:
+            return f">>> ALERT (WARNING): {message}"
+        return message
+
+
 def setup_logging(output_root: Path):
+    # Force line-buffered stdout/stderr so console output appears live as it
+    # happens, instead of batching inside a pipe buffer (relevant when run
+    # from a frozen .exe or redirected output - makes long-running modules
+    # look "stuck" even though they are actively working).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     log_path = output_root / "_script_execution.log"
     logger = logging.getLogger("dfir_triage")
     logger.setLevel(logging.DEBUG)
@@ -262,7 +310,7 @@ def setup_logging(output_root: Path):
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    ch.setFormatter(ConsoleFormatter())
 
     logger.addHandler(fh)
     logger.addHandler(ch)
@@ -277,20 +325,37 @@ def setup_logging(output_root: Path):
 NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
 
-def parse_evtx_file(evtx_path: Path, logger, event_id_filter=None, max_records=None):
+def parse_evtx_file(evtx_path: Path, logger, event_id_filter=None, max_records=None,
+                     context_label=None, progress_interval=20000):
     """Generic EVTX -> list[dict] extractor. Captures all EventData/UserData
     fields dynamically (so we don't need per-EventID schema knowledge), plus
     the common System fields. A single corrupt record is skipped without
-    aborting the rest of the log."""
+    aborting the rest of the log.
+
+    Large EVTX files (Security.evtx / Sysmon operational especially) can
+    take minutes to scan with a pure-Python parser. This logs a heartbeat
+    every `progress_interval` records so the console shows the tool is
+    actively working instead of looking frozen."""
     if not HAVE_EVTX:
         raise RuntimeError("python-evtx not installed (pip install python-evtx)")
 
     import xml.etree.ElementTree as ET
     from Evtx.Evtx import Evtx
 
+    label = context_label or evtx_path.name
     records = []
+    scanned = 0
+    start = time.time()
+    logger.info(f"Parsing {label} - scanning records (this can take a while for large logs)...")
     with Evtx(str(evtx_path)) as evtx:
         for record in evtx.records():
+            scanned += 1
+            if scanned % progress_interval == 0:
+                elapsed = time.time() - start
+                logger.info(
+                    f"  ...{label}: {scanned:,} records scanned, {len(records):,} matched "
+                    f"({elapsed:.0f}s elapsed)"
+                )
             try:
                 root = ET.fromstring(record.xml())
                 system = root.find(f"{NS}System")
@@ -348,6 +413,8 @@ def parse_evtx_file(evtx_path: Path, logger, event_id_filter=None, max_records=N
             except Exception as e:
                 logger.debug(f"Skipped corrupt EVTX record in {evtx_path}: {e}")
                 continue
+    elapsed = time.time() - start
+    logger.info(f"Finished {label}: {scanned:,} records scanned, {len(records):,} matched ({elapsed:.1f}s)")
     return records
 
 
@@ -385,59 +452,109 @@ EVTX_LOG_PATHS = {
 }
 
 
-def copy_and_parse_evtx(target_root, out_dir, logger, log_key, event_id_filter, max_records):
+def copy_and_parse_evtx(target_root, out_dir, logger, log_key, event_id_filter, max_records, context_label=None):
     """Copy a single named EVTX log (if present) then parse the copy."""
     rel_path = EVTX_LOG_PATHS[log_key]
     src = find_existing(target_root, rel_path)
     if not src:
         logger.info(f"[{log_key}] log not found on target (skipped): {rel_path}")
         return []
+    try:
+        logger.info(f"[{log_key}] found: {src.name} ({human_size(src.stat().st_size)})")
+    except Exception:
+        pass
     raw_dir = out_dir / "Raw_Copies"
     local_copy = safe_copy(src, raw_dir, logger)
     if not local_copy:
         return []
     try:
-        return parse_evtx_file(local_copy, logger, event_id_filter, max_records)
+        return parse_evtx_file(local_copy, logger, event_id_filter, max_records, context_label=context_label or log_key)
     except Exception as e:
-        logger.error(f"[{log_key}] failed to parse: {e}")
+        logger.error(f"[{log_key}] failed to parse: {e} - continuing with remaining artifacts\n{traceback.format_exc()}")
         return []
 
 
 # ==========================================================================
-# MODULE 1: Process Creation (Security 4688 + Sysmon EventID 1)
+# MODULE 1 + 7: Process Creation (Security 4688 + Sysmon EventID 1) and
+# Authentication (Security 4624/4625/4648/4720)
+#
+# Security.evtx is typically the largest log on the box, and is needed by
+# both categories. It is parsed ONCE here (with the union of all event IDs
+# either category needs) and the results are split afterward, instead of
+# doing two full passes over a potentially multi-GB file.
 # ==========================================================================
 
-def module_process_creation(target_root, dirs, logger, max_records):
-    out_dir = dirs["01_ProcessCreation"]
-    all_records = []
+LOGON_TYPE_MAP = {
+    "2": "Interactive", "3": "Network", "4": "Batch", "5": "Service",
+    "7": "Unlock", "8": "NetworkCleartext", "9": "NewCredentials",
+    "10": "RemoteInteractive (RDP)", "11": "CachedInteractive",
+}
+
+
+def module_process_creation_and_authentication(target_root, dirs, logger, max_records):
+    pc_dir = dirs["01_ProcessCreation"]
+    auth_dir = dirs["07_Authentication"]
+    pc_records = []
+    auth_records = []
+
     try:
-        sec_records = copy_and_parse_evtx(target_root, out_dir, logger, "Security", {4688}, max_records)
-        for r in sec_records:
-            r["ArtifactSource"] = "Security.evtx (EventID 4688)"
-        all_records.extend(sec_records)
-        logger.info(f"Process Creation: {len(sec_records)} Security 4688 events parsed")
+        security_events = copy_and_parse_evtx(
+            target_root, pc_dir, logger, "Security",
+            {4688, 4624, 4625, 4648, 4720}, max_records,
+            context_label="Security.evtx (4688/4624/4625/4648/4720)",
+        )
+        for r in security_events:
+            if r.get("EventID") == 4688:
+                r["ArtifactSource"] = "Security.evtx (EventID 4688)"
+                pc_records.append(r)
+            else:
+                if r.get("EventID") == 4624:
+                    ed = r.get("EventData", {})
+                    r["LogonTypeFriendly"] = LOGON_TYPE_MAP.get(str(ed.get("LogonType")), ed.get("LogonType"))
+                auth_records.append(r)
+        logger.info(f"Security.evtx: {len(pc_records)} process-creation (4688) + "
+                    f"{len(auth_records)} authentication (4624/4625/4648/4720) events")
+        if auth_dir != pc_dir:
+            try:
+                note = auth_dir / "Raw_Copies" / "README_Security_evtx_location.txt"
+                note.parent.mkdir(parents=True, exist_ok=True)
+                note.write_text(
+                    "Security.evtx is parsed once for both Process Creation and Authentication.\n"
+                    "The raw copy is stored under:\n"
+                    "  Raw_Data\\01_ProcessCreation\\Raw_Copies\\Security.evtx\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
     except Exception as e:
-        logger.error(f"Process Creation (Security 4688) module failed: {e}\n{traceback.format_exc()}")
+        logger.error(f"Security.evtx parsing failed: {e} - continuing with remaining artifacts"
+                      f"\n{traceback.format_exc()}")
 
     try:
         sysmon_path = find_existing(target_root, EVTX_LOG_PATHS["Sysmon"])
         if sysmon_path:
-            sysmon_records = copy_and_parse_evtx(target_root, out_dir, logger, "Sysmon", {1}, max_records)
+            sysmon_records = copy_and_parse_evtx(target_root, pc_dir, logger, "Sysmon", {1}, max_records)
             for r in sysmon_records:
                 r["ArtifactSource"] = "Sysmon Operational (EventID 1)"
-            all_records.extend(sysmon_records)
+            pc_records.extend(sysmon_records)
             logger.info(f"Process Creation: {len(sysmon_records)} Sysmon EventID 1 events parsed")
         else:
             logger.info("Sysmon operational log not present on target - skipped (not an error).")
     except Exception as e:
-        logger.error(f"Process Creation (Sysmon) module failed: {e}\n{traceback.format_exc()}")
+        logger.error(f"Process Creation (Sysmon) module failed: {e} - continuing with remaining artifacts"
+                      f"\n{traceback.format_exc()}")
 
     try:
-        write_evtx_records(all_records, out_dir, "process_creation", logger)
+        write_evtx_records(pc_records, pc_dir, "process_creation", logger)
     except Exception as e:
         logger.error(f"Failed writing process creation output: {e}")
 
-    return all_records
+    try:
+        write_evtx_records(auth_records, auth_dir, "authentication_events", logger)
+    except Exception as e:
+        logger.error(f"Failed writing authentication output: {e}")
+
+    return {"process_creation": pc_records, "authentication": auth_records}
 
 
 # ==========================================================================
@@ -880,31 +997,9 @@ def module_usb_history(target_root, dirs, logger):
     return {"setupapi": setupapi_records, "registry": registry_records}
 
 
-# ==========================================================================
-# MODULE 7: Authentication (4624, 4625, 4648, 4720)
-# ==========================================================================
-
-LOGON_TYPE_MAP = {
-    "2": "Interactive", "3": "Network", "4": "Batch", "5": "Service",
-    "7": "Unlock", "8": "NetworkCleartext", "9": "NewCredentials",
-    "10": "RemoteInteractive (RDP)", "11": "CachedInteractive",
-}
-
-
-def module_authentication(target_root, dirs, logger, max_records):
-    out_dir = dirs["07_Authentication"]
-    records = []
-    try:
-        records = copy_and_parse_evtx(target_root, out_dir, logger, "Security", {4624, 4625, 4648, 4720}, max_records)
-        for r in records:
-            ed = r.get("EventData", {})
-            if r["EventID"] == 4624:
-                r["LogonTypeFriendly"] = LOGON_TYPE_MAP.get(str(ed.get("LogonType")), ed.get("LogonType"))
-        logger.info(f"Authentication: {len(records)} events (4624/4625/4648/4720) parsed")
-    except Exception as e:
-        logger.error(f"Authentication module failed: {e}\n{traceback.format_exc()}")
-    write_evtx_records(records, out_dir, "authentication_events", logger)
-    return records
+# Authentication (4624/4625/4648/4720) is now parsed together with Process
+# Creation by module_process_creation_and_authentication() above, since both
+# read from Security.evtx and that log is the expensive part to scan.
 
 
 # ==========================================================================
@@ -1890,31 +1985,51 @@ def main():
 
     results = {}
 
+    # Ordered fastest-first: quick, self-contained modules run up front so the
+    # console shows steady progress immediately after launch, and the slow,
+    # potentially multi-GB EVTX logs (Security.evtx especially) run last,
+    # with their own progress heartbeats (see parse_evtx_file) so they never
+    # look frozen even though they can legitimately take minutes.
     module_plan = [
-        ("process_creation", lambda: module_process_creation(target_root, dirs, logger, max_records)),
-        ("network", lambda: module_network(target_root, dirs, logger, max_records)),
-        ("dhcp", lambda: module_dhcp(target_root, dirs, logger, max_records)),
-        ("dns", lambda: module_dns(target_root, dirs, logger, max_records)),
-        ("recycle_bin", lambda: module_recycle_bin(target_root, dirs, logger)),
-        ("usb", lambda: module_usb_history(target_root, dirs, logger)),
-        ("authentication", lambda: module_authentication(target_root, dirs, logger, max_records)),
-        ("persistence", lambda: module_persistence(target_root, dirs, logger)),
-        ("execution", lambda: module_execution(target_root, dirs, logger, copy_raw)),
-        ("user_activity", lambda: module_user_activity(target_root, dirs, logger, copy_raw)),
+        ("recycle_bin", "Recycle Bin", lambda: module_recycle_bin(target_root, dirs, logger)),
+        ("usb", "USB Device History", lambda: module_usb_history(target_root, dirs, logger)),
+        ("persistence", "Persistence Mechanisms", lambda: module_persistence(target_root, dirs, logger)),
+        ("execution", "Execution Artifacts (Prefetch/Amcache/Shimcache)",
+         lambda: module_execution(target_root, dirs, logger, copy_raw)),
+        ("user_activity", "User Activity (LNK/JumpLists/Shellbags)",
+         lambda: module_user_activity(target_root, dirs, logger, copy_raw)),
+        ("network", "Network Events", lambda: module_network(target_root, dirs, logger, max_records)),
+        ("dhcp", "DHCP Events", lambda: module_dhcp(target_root, dirs, logger, max_records)),
+        ("dns", "DNS Artifacts", lambda: module_dns(target_root, dirs, logger, max_records)),
+        ("security", "Process Creation + Authentication (Security.evtx / Sysmon)",
+         lambda: module_process_creation_and_authentication(target_root, dirs, logger, max_records)),
     ]
 
-    for key, fn in module_plan:
-        logger.info(f"--- Running module: {key} ---")
+    total_modules = len(module_plan)
+    for i, (key, label, fn) in enumerate(module_plan, start=1):
+        logger.info(f"\n========== [{i}/{total_modules}] {label} ==========")
+        module_start = time.time()
         try:
             results[key] = fn()
         except Exception as e:
-            logger.error(f"UNCAUGHT error in module '{key}': {e}\n{traceback.format_exc()}")
-            results[key] = [] if key not in ("usb", "persistence", "execution", "user_activity") else {}
+            logger.error(f"Uncaught error in module '{label}': {e} - continuing with remaining "
+                         f"modules, nothing collected here will be lost from the rest of the run"
+                         f"\n{traceback.format_exc()}")
+            results[key] = {}
+        logger.info(f"[{i}/{total_modules}] {label} finished in {time.time() - module_start:.1f}s")
+
+    # The combined Security.evtx module returns a dict with both of its
+    # category results; unpack it into the two separate keys the summary
+    # report expects.
+    combined = results.pop("security", {})
+    results["process_creation"] = combined.get("process_creation", [])
+    results["authentication"] = combined.get("authentication", [])
 
     deps_status = {"python-evtx": HAVE_EVTX, "regipy": HAVE_REGIPY, "olefile": HAVE_OLEFILE}
     generate_summary_report(output_root, target_root, target_name, start_time, results, logger, deps_status)
 
-    logger.info(f"=== DFIR Triage finished. Output: {output_root} ===")
+    total_elapsed = datetime.datetime.now() - start_time
+    logger.info(f"=== DFIR Triage finished in {total_elapsed}. Output: {output_root} ===")
     print(f"\nDone. Output folder:\n  {output_root}\n")
     print(f"Execution log: {log_path}")
     print(f"Summary report: {output_root / 'Investigation_Summary.txt'}")
