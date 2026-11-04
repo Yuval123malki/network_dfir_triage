@@ -138,12 +138,24 @@ def human_size(num_bytes):
     return f"{num_bytes:.1f} PB"
 
 
+def progress_tick(logger, label, count, interval, start_time=None, total=None):
+    """Shared heartbeat helper: call inside any loop that might run long
+    enough for the console to otherwise look frozen. Prints every
+    `interval` items, with elapsed time and (if known) a running total."""
+    if interval <= 0 or count % interval != 0:
+        return
+    elapsed = f", {time.time() - start_time:.0f}s elapsed" if start_time else ""
+    of_total = f" / {total:,}" if total else ""
+    logger.info(f"  ...{label}: {count:,}{of_total} processed{elapsed}")
+
+
 def safe_copy(src: Path, dest_dir: Path, logger, announce=True) -> Path:
     """Read-only copy of a single file from the target drive into our output
     tree. Returns the destination Path, or None on failure. Never opens the
     source for writing. Streams in chunks (never loads the whole file into
     memory) so multi-GB EVTX logs / hives don't blow up RAM, and announces
-    large copies on the console so the tool doesn't look frozen."""
+    large copies (plus periodic progress) on the console so the tool never
+    looks frozen during a slow copy."""
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / src.name
@@ -153,15 +165,27 @@ def safe_copy(src: Path, dest_dir: Path, logger, announce=True) -> Path:
             dest_path = dest_dir / f"{src.parent.name}_{src.name}"
 
         size = src.stat().st_size
-        if announce and size > 25 * 1024 * 1024:
+        is_large = size > 25 * 1024 * 1024
+        if announce and is_large:
             logger.info(f"Copying {src.name} ({human_size(size)}) - this may take a moment...")
 
         start = time.time()
+        chunk_size = 4 * 1024 * 1024
+        copied = 0
+        last_announce = start
         with open(src, "rb") as fsrc, open(dest_path, "wb") as fdst:
-            import shutil as _shutil
-            _shutil.copyfileobj(fsrc, fdst, length=4 * 1024 * 1024)
+            while True:
+                chunk = fsrc.read(chunk_size)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                copied += len(chunk)
+                if is_large and (time.time() - last_announce) >= 10:
+                    pct = (copied / size * 100) if size else 100
+                    logger.info(f"  ...copying {src.name}: {human_size(copied)} / {human_size(size)} ({pct:.0f}%)")
+                    last_announce = time.time()
 
-        if announce and size > 25 * 1024 * 1024:
+        if announce and is_large:
             elapsed = time.time() - start
             logger.info(f"Copied {src.name} ({human_size(size)}) in {elapsed:.1f}s")
         return dest_path
@@ -766,15 +790,19 @@ def module_recycle_bin(target_root, dirs, logger):
         return records
 
     try:
-        for sid_dir in recycle_root.iterdir():
-            if not sid_dir.is_dir():
-                continue
+        sid_dirs = [d for d in recycle_root.iterdir() if d.is_dir()]
+        logger.info(f"Recycle Bin: found {len(sid_dirs)} user SID folder(s) to scan")
+        start = time.time()
+        scanned_items = 0
+        for sid_dir in sid_dirs:
             sid = sid_dir.name
             username = resolve_sid_to_username(target_root, sid, logger)
             try:
                 for item in sid_dir.iterdir():
                     if not item.is_file() or not item.name.startswith("$I"):
                         continue
+                    scanned_items += 1
+                    progress_tick(logger, "Recycle Bin", scanned_items, 500, start_time=start)
                     parsed = parse_i_file(item, logger)
                     if not parsed:
                         continue
@@ -898,7 +926,10 @@ def module_setupapi_logs(target_root, out_dir, logger):
                 logger.warning(f"Could not read {path}: {e}")
                 continue
         try:
-            for line in lines:
+            logger.info(f"Scanning {path.name}: {len(lines):,} lines")
+            scan_start = time.time()
+            for i, line in enumerate(lines, 1):
+                progress_tick(logger, f"SetupAPI {path.name}", i, 100000, start_time=scan_start, total=len(lines))
                 line = line.rstrip("\n")
                 m = SETUPAPI_LINE_RE.match(line)
                 if m:
@@ -955,7 +986,12 @@ def module_usb_registry(target_root, out_dir, logger):
             # and mostly not USB-relevant; we still capture subkey names/timestamps.
             max_depth = 3 if label == "DeviceClasses" else 5
             count_before = len(records)
+            logger.info(f"Scanning registry key [{label}]: {path} (max depth {max_depth})...")
+            scan_start = time.time()
+            scanned = 0
             for sub_path, value_name, value_type, value in recurse_registry(key, path, logger, max_depth=max_depth):
+                scanned += 1
+                progress_tick(logger, f"USB registry [{label}]", scanned, 5000, start_time=scan_start)
                 name_lower = (sub_path or "").lower()
                 if label == "DeviceClasses" and "usb" not in name_lower and "disk" not in name_lower:
                     continue
@@ -966,7 +1002,8 @@ def module_usb_registry(target_root, out_dir, logger):
                     "ValueType": value_type,
                     "Value": str(value)[:500],
                 })
-            logger.info(f"USB registry [{label}]: {len(records) - count_before} value(s) captured")
+            logger.info(f"USB registry [{label}]: {scanned:,} values scanned, "
+                        f"{len(records) - count_before} captured ({time.time() - scan_start:.1f}s)")
     except Exception as e:
         logger.error(f"USB registry module failed: {e}\n{traceback.format_exc()}")
     return records
@@ -1050,10 +1087,13 @@ def module_persistence_run_keys(target_root, out_dir, logger):
     except Exception as e:
         logger.error(f"SOFTWARE Run key parsing failed: {e}")
 
-    for username, profile_path in iter_user_profiles(target_root):
+    profiles = list(iter_user_profiles(target_root))
+    logger.info(f"Run keys: checking NTUSER.DAT for {len(profiles)} user profile(s)")
+    for username, profile_path in profiles:
         ntuser_path = profile_path / "NTUSER.DAT"
         if not ntuser_path.exists():
             continue
+        logger.info(f"  ...scanning NTUSER.DAT for user '{username}'")
         try:
             local_copy = safe_copy(ntuser_path, out_dir / "Raw_Copies" / "NTUSER" / username, logger)
             if not local_copy:
@@ -1090,13 +1130,18 @@ def module_persistence_services(target_root, out_dir, logger):
         ccs = get_current_control_set(hive, logger)
         services_path = rf"{ccs}\Services"
         key = hive.get_key(services_path)
+        logger.info("Persistence: enumerating Services...")
+        scan_start = time.time()
+        scanned = 0
         for sk in safe_iter_subkeys(key, logger):
+            scanned += 1
+            progress_tick(logger, "Services", scanned, 200, start_time=scan_start)
             entry = {"ServiceName": getattr(sk, "name", "?")}
             for v in safe_iter_values(sk, logger):
                 if v.name in ("ImagePath", "DisplayName", "Start", "Type", "Description"):
                     entry[v.name] = str(v.value)[:500]
             records.append(entry)
-        logger.info(f"Persistence (Services): {len(records)} services enumerated")
+        logger.info(f"Persistence (Services): {len(records)} services enumerated ({time.time() - scan_start:.1f}s)")
     except Exception as e:
         logger.error(f"Services enumeration failed: {e}\n{traceback.format_exc()}")
     return records
@@ -1114,9 +1159,11 @@ def module_persistence_scheduled_tasks(target_root, out_dir, logger):
         logger.info("Scheduled Tasks folder not found - skipped.")
         return records
 
-    for task_file in tasks_root.rglob("*"):
-        if not task_file.is_file():
-            continue
+    task_files = [f for f in tasks_root.rglob("*") if f.is_file()]
+    logger.info(f"Scheduled Tasks: found {len(task_files):,} file(s) to parse")
+    scan_start = time.time()
+    for i, task_file in enumerate(task_files, 1):
+        progress_tick(logger, "Scheduled Tasks", i, 1000, start_time=scan_start, total=len(task_files))
         try:
             raw = task_file.read_text(encoding="utf-16", errors="ignore")
             if not raw.strip().startswith("<?xml") and "<Task" not in raw:
@@ -1264,13 +1311,17 @@ def module_prefetch(target_root, out_dir, logger, copy_raw):
         logger.info("Prefetch folder not found - skipped.")
         return records
     try:
-        for pf_file in pf_dir.glob("*.pf"):
+        pf_files = list(pf_dir.glob("*.pf"))
+        logger.info(f"Prefetch: found {len(pf_files):,} .pf file(s) to parse")
+        scan_start = time.time()
+        for i, pf_file in enumerate(pf_files, 1):
+            progress_tick(logger, "Prefetch", i, 1000, start_time=scan_start, total=len(pf_files))
             parsed = parse_prefetch_file(pf_file, logger)
             if parsed:
                 records.append(parsed)
                 if copy_raw:
-                    safe_copy(pf_file, out_dir / "Raw_Copies" / "Prefetch", logger)
-        logger.info(f"Prefetch: {len(records)} .pf files parsed")
+                    safe_copy(pf_file, out_dir / "Raw_Copies" / "Prefetch", logger, announce=False)
+        logger.info(f"Prefetch: {len(records)} .pf files parsed ({time.time() - scan_start:.1f}s)")
     except Exception as e:
         logger.error(f"Prefetch module failed: {e}\n{traceback.format_exc()}")
     return records
@@ -1296,9 +1347,13 @@ def module_amcache(target_root, out_dir, logger):
         from regipy.registry import RegistryHive
 
         hive = RegistryHive(str(local_copy))
+        scan_start = time.time()
         try:
             key = hive.get_key(r"Root\InventoryApplicationFile")
+            scanned = 0
             for sk in safe_iter_subkeys(key, logger):
+                scanned += 1
+                progress_tick(logger, "Amcache (InventoryApplicationFile)", scanned, 2000, start_time=scan_start)
                 entry = {"Source": "InventoryApplicationFile", "Key": getattr(sk, "name", "?")}
                 for v in safe_iter_values(sk, logger):
                     if v.name in ("LowerCaseLongPath", "ProductName", "Publisher", "Version",
@@ -1311,8 +1366,11 @@ def module_amcache(target_root, out_dir, logger):
         if not records:
             try:
                 key = hive.get_key(r"Root\File")
+                scanned = 0
                 for vol_key in safe_iter_subkeys(key, logger):
                     for file_key in safe_iter_subkeys(vol_key, logger):
+                        scanned += 1
+                        progress_tick(logger, "Amcache (Root\\File legacy)", scanned, 2000, start_time=scan_start)
                         entry = {"Source": "Root\\File (legacy)", "Key": getattr(file_key, "name", "?")}
                         for v in safe_iter_values(file_key, logger):
                             entry[f"Value_{v.name}"] = str(v.value)[:500]
@@ -1320,7 +1378,8 @@ def module_amcache(target_root, out_dir, logger):
             except Exception:
                 logger.debug("Legacy Root\\File Amcache layout not present either.")
 
-        logger.info(f"Amcache: {len(records)} executed-binary records (best effort - verify with AmcacheParser for deep dive)")
+        logger.info(f"Amcache: {len(records)} executed-binary records in {time.time() - scan_start:.1f}s "
+                    f"(best effort - verify with AmcacheParser for deep dive)")
     except Exception as e:
         logger.error(f"Amcache parsing failed: {e}\n{traceback.format_exc()}")
     return records
@@ -1573,7 +1632,12 @@ def parse_lnk_bytes(data: bytes, logger):
 
 def module_lnk_files(target_root, out_dir, logger, copy_raw):
     records = []
-    for username, profile_path in iter_user_profiles(target_root):
+    profiles = list(iter_user_profiles(target_root))
+    logger.info(f"LNK files: scanning {len(profiles)} user profile(s)")
+    scan_start = time.time()
+    scanned = 0
+    for username, profile_path in profiles:
+        logger.info(f"  ...scanning LNK locations for user '{username}'")
         search_roots = [
             profile_path / "Desktop",
             profile_path / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Recent",
@@ -1584,6 +1648,8 @@ def module_lnk_files(target_root, out_dir, logger, copy_raw):
                 continue
             try:
                 for lnk_file in root.rglob("*.lnk"):
+                    scanned += 1
+                    progress_tick(logger, "LNK files", scanned, 2000, start_time=scan_start)
                     try:
                         data = lnk_file.read_bytes()
                         parsed = parse_lnk_bytes(data, logger)
@@ -1593,12 +1659,12 @@ def module_lnk_files(target_root, out_dir, logger, copy_raw):
                             parsed["LnkFileName"] = lnk_file.name
                             records.append(parsed)
                             if copy_raw:
-                                safe_copy(lnk_file, out_dir / "Raw_Copies" / "LNK" / username, logger)
+                                safe_copy(lnk_file, out_dir / "Raw_Copies" / "LNK" / username, logger, announce=False)
                     except Exception as e:
                         logger.debug(f"Failed to parse LNK {lnk_file}: {e}")
             except Exception as e:
                 logger.debug(f"Error walking {root}: {e}")
-    logger.info(f"User Activity: {len(records)} LNK files parsed")
+    logger.info(f"User Activity: {len(records)} LNK files parsed ({scanned:,} scanned, {time.time() - scan_start:.1f}s)")
     return records
 
 
@@ -1610,15 +1676,21 @@ def module_jump_lists(target_root, out_dir, logger, copy_raw):
     records = []
     lnk_clsid = struct.pack("<I", 0x4C) + bytes.fromhex("0114020000000000C000000000000046")  # HeaderSize+LinkCLSID
 
-    for username, profile_path in iter_user_profiles(target_root):
+    profiles = list(iter_user_profiles(target_root))
+    logger.info(f"Jump Lists: scanning {len(profiles)} user profile(s)")
+    scan_start = time.time()
+    files_scanned = 0
+    for username, profile_path in profiles:
         auto_dest_dir = profile_path / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Recent" / "AutomaticDestinations"
         custom_dest_dir = profile_path / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Recent" / "CustomDestinations"
 
         if auto_dest_dir.exists() and HAVE_OLEFILE:
             for ad_file in auto_dest_dir.glob("*.automaticDestinations-ms"):
+                files_scanned += 1
+                progress_tick(logger, "Jump Lists", files_scanned, 200, start_time=scan_start)
                 try:
                     if copy_raw:
-                        safe_copy(ad_file, out_dir / "Raw_Copies" / "JumpLists" / username, logger)
+                        safe_copy(ad_file, out_dir / "Raw_Copies" / "JumpLists" / username, logger, announce=False)
                     ole = olefile.OleFileIO(str(ad_file))
                     for stream_path in ole.listdir():
                         stream_name = stream_path[-1]
@@ -1643,9 +1715,11 @@ def module_jump_lists(target_root, out_dir, logger, copy_raw):
 
         if custom_dest_dir.exists():
             for cd_file in custom_dest_dir.glob("*.customDestinations-ms"):
+                files_scanned += 1
+                progress_tick(logger, "Jump Lists", files_scanned, 200, start_time=scan_start)
                 try:
                     if copy_raw:
-                        safe_copy(cd_file, out_dir / "Raw_Copies" / "JumpLists" / username, logger)
+                        safe_copy(cd_file, out_dir / "Raw_Copies" / "JumpLists" / username, logger, announce=False)
                     raw = cd_file.read_bytes()
                     search_from = 0
                     while True:
@@ -1662,7 +1736,8 @@ def module_jump_lists(target_root, out_dir, logger, copy_raw):
                 except Exception as e:
                     logger.debug(f"Failed to parse CustomDestinations file {cd_file}: {e}")
 
-    logger.info(f"User Activity: {len(records)} Jump List entries parsed")
+    logger.info(f"User Activity: {len(records)} Jump List entries parsed "
+                f"({files_scanned:,} files scanned, {time.time() - scan_start:.1f}s)")
     return records
 
 
@@ -1684,10 +1759,15 @@ def module_shellbags(target_root, out_dir, logger, copy_raw):
         r"Software\Microsoft\Windows\Shell\BagMRU",
     ]
 
-    for username, profile_path in iter_user_profiles(target_root):
+    profiles = list(iter_user_profiles(target_root))
+    logger.info(f"Shellbags: scanning {len(profiles)} user profile(s)")
+    scan_start = time.time()
+    scanned = 0
+    for username, profile_path in profiles:
         usrclass_path = profile_path / "AppData" / "Local" / "Microsoft" / "Windows" / "UsrClass.dat"
         if not usrclass_path.exists():
             continue
+        logger.info(f"  ...scanning BagMRU for user '{username}'")
         try:
             local_copy = safe_copy(usrclass_path, out_dir / "Raw_Copies" / "UsrClass" / username, logger)
             if not local_copy:
@@ -1699,6 +1779,8 @@ def module_shellbags(target_root, out_dir, logger, copy_raw):
                 except Exception:
                     continue
                 for path, value_name, value_type, value in recurse_registry(key, bagmru_path, logger, max_depth=15):
+                    scanned += 1
+                    progress_tick(logger, "Shellbags", scanned, 5000, start_time=scan_start)
                     if value_name == "MRUListEx" or not isinstance(value, (bytes, bytearray)):
                         continue
                     name = extract_best_effort_shell_item_name(bytes(value))
@@ -1712,7 +1794,8 @@ def module_shellbags(target_root, out_dir, logger, copy_raw):
         except Exception as e:
             logger.warning(f"Shellbags parsing failed for {username}: {e}")
 
-    logger.info(f"User Activity: {len(records)} Shellbag entries parsed (best effort)")
+    logger.info(f"User Activity: {len(records)} Shellbag entries parsed (best effort, "
+                f"{scanned:,} values scanned, {time.time() - scan_start:.1f}s)")
     return records
 
 
